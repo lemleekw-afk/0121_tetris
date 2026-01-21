@@ -8,7 +8,6 @@ import {
   ROWS, 
   COLOR_PALETTE, 
   FALL_DURATION,
-  FALLBACK_WORDS,
   SPAWN_DELAY
 } from './types';
 
@@ -22,6 +21,7 @@ const App: React.FC = () => {
   const [isLobby, setIsLobby] = useState(true);
   const [isLoadingWords, setIsLoadingWords] = useState(false);
   const [loadingTime, setLoadingTime] = useState(0);
+  const [errorMessage, setErrorMessage] = useState<string | null>(null);
 
   // Game States
   const [score, setScore] = useState(0);
@@ -46,13 +46,14 @@ const App: React.FC = () => {
   const spawnTimerRef = useRef<number | null>(null);
   const comboTimeoutRef = useRef<number | null>(null);
   const loadingTimerRef = useRef<number | null>(null);
+  const abortControllerRef = useRef<AbortController | null>(null);
 
-  // --- Gemini API for Theme Words (Updated to 20 words for current request) ---
+  // --- Gemini API for Theme Words (Strict Failure Policy) ---
   const generateWordsByTheme = async (selectedTheme: string): Promise<string[]> => {
-    // Fixed: Initialized GoogleGenAI according to strict guidelines (no 'as string')
     const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+    
     try {
-      // 10초 타임아웃을 염두에 둔 비동기 처리
+      // Vercel 10s timeout strategy
       const response = await ai.models.generateContent({
         model: 'gemini-3-flash-preview',
         contents: `당신은 단어 퍼즐 게임의 기획자입니다. 사용자가 입력한 [주제]와 매우 밀접한 한국어 단어 20개를 생성하세요.
@@ -63,21 +64,25 @@ const App: React.FC = () => {
           
           주제: ${selectedTheme}`,
       });
+
       const text = response.text || "";
       const jsonStr = text.match(/\[.*\]/s)?.[0] || "";
       const parsed: string[] = JSON.parse(jsonStr);
       const filtered = parsed.filter(w => /^[가-힣]+$/.test(w) && w.length >= 2 && w.length <= 6);
       
-      if (filtered.length < 5) throw new Error("Validation failed");
+      if (filtered.length < 5) throw new Error("VALIDATION_ERROR");
       return filtered.slice(0, 20);
-    } catch (error) {
-      console.error("AI Generation failed/timeout:", error);
-      // Fallback Data 즉시 할당
-      return [...FALLBACK_WORDS].concat(['산책', '바람', '햇볕', '달빛', '별똥별', '들꽃', '숲길', '호수', '여울', '단비']);
+    } catch (error: any) {
+      console.error("AI Generation Error:", error);
+      // 에러 객체에 따라 상세 코드 할당
+      if (error.status === 401 || error.status === 403) throw new Error("AUTH_ERROR");
+      if (error.status === 429) throw new Error("RATE_LIMIT");
+      if (error.message === "VALIDATION_ERROR") throw new Error("DATA_ERROR");
+      throw error;
     }
   };
 
-  // --- Supabase Actions (Theme Column Added) ---
+  // --- Supabase Actions ---
   const fetchRankings = async () => {
     setIsLoadingRankings(true);
     try {
@@ -90,7 +95,7 @@ const App: React.FC = () => {
   };
 
   const updateRanking = async (finalScore: number, finalTheme: string) => {
-    if (!playerName.trim()) return;
+    if (!playerName.trim() || gameWordPool.length === 0) return;
     try {
       const checkRes = await fetch(`${SUPABASE_URL}/rest/v1/rankings?name=eq.${encodeURIComponent(playerName)}`, {
         headers: { 'apikey': SUPABASE_KEY, 'Authorization': `Bearer ${SUPABASE_KEY}` }
@@ -184,6 +189,7 @@ const App: React.FC = () => {
   };
 
   const startSpawnCountdown = useCallback(() => {
+    if (gameWordPool.length === 0) return;
     setNextSpawnTimer(1);
     if (spawnTimerRef.current) clearInterval(spawnTimerRef.current);
     spawnTimerRef.current = window.setInterval(() => {
@@ -319,30 +325,60 @@ const App: React.FC = () => {
     if (!playerName.trim() || !theme.trim()) return;
     setIsLoadingWords(true);
     setLoadingTime(0);
+    setErrorMessage(null);
     
-    // 로딩 타이머 시작 (15초 체크)
+    // 로딩 타이머
     if (loadingTimerRef.current) clearInterval(loadingTimerRef.current);
     loadingTimerRef.current = window.setInterval(() => {
-      setLoadingTime(prev => prev + 1);
+      setLoadingTime(prev => {
+        if (prev >= 10) {
+          clearInterval(loadingTimerRef.current!);
+          setErrorMessage("Vercel 서버리스 시간 초과(10초)가 발생했습니다. API 응답 속도 최적화가 필요합니다.");
+          setIsLoadingWords(false);
+          return prev;
+        }
+        return prev + 1;
+      });
     }, 1000);
 
-    const words = await generateWordsByTheme(theme);
-    
-    // 타이머 정리
-    if (loadingTimerRef.current) clearInterval(loadingTimerRef.current);
-    
-    const colorMap: Record<string, string> = {};
-    words.forEach((w, i) => { colorMap[w] = COLOR_PALETTE[i % COLOR_PALETTE.length]; });
-    setGameWordPool(words);
-    setWordColorMap(colorMap);
-    setNextWord(words[Math.floor(Math.random() * words.length)]);
-    setIsLoadingWords(false);
-    setIsLobby(false);
-    setGameOver(false);
-    setScore(0);
-    setBoard(Array.from({ length: ROWS }, () => Array(COLUMNS).fill(null)));
-    setMovingObject(null);
-    setNextSpawnTimer(null);
+    try {
+      const words = await generateWordsByTheme(theme);
+      
+      // 성공 시 타이머 정리
+      if (loadingTimerRef.current) clearInterval(loadingTimerRef.current);
+      
+      const colorMap: Record<string, string> = {};
+      words.forEach((w, i) => { colorMap[w] = COLOR_PALETTE[i % COLOR_PALETTE.length]; });
+      setGameWordPool(words);
+      setWordColorMap(colorMap);
+      setNextWord(words[Math.floor(Math.random() * words.length)]);
+      setIsLoadingWords(false);
+      setIsLobby(false);
+      setGameOver(false);
+      setScore(0);
+      setBoard(Array.from({ length: ROWS }, () => Array(COLUMNS).fill(null)));
+      setMovingObject(null);
+      setNextSpawnTimer(null);
+    } catch (error: any) {
+      if (loadingTimerRef.current) clearInterval(loadingTimerRef.current);
+      setIsLoadingWords(false);
+      
+      // 상세 에러 메시지 맵핑
+      switch(error.message) {
+        case "AUTH_ERROR":
+          setErrorMessage("API 키가 유효하지 않거나 환경 변수 설정이 누락되었습니다. Vercel 설정을 확인하십시오.");
+          break;
+        case "RATE_LIMIT":
+          setErrorMessage("API 요청 횟수 제한을 초과했습니다. 잠시 후 다시 시도하십시오.");
+          break;
+        case "DATA_ERROR":
+          setErrorMessage("AI가 유효한 단어 데이터를 생성하지 못했습니다. 다른 주제로 시도해 주세요.");
+          break;
+        default:
+          setErrorMessage("클라이언트와 서버 간 연결이 끊겼습니다. 네트워크 상태를 점검하십시오.");
+          break;
+      }
+    }
   };
 
   const resetToLobby = () => {
@@ -354,6 +390,7 @@ const App: React.FC = () => {
     setNextSpawnTimer(null);
     setInputValue('');
     setGameWordPool([]);
+    setErrorMessage(null);
   };
 
   useEffect(() => { fetchRankings(); }, []);
@@ -362,7 +399,7 @@ const App: React.FC = () => {
   }, [isLobby, gameWordPool.length, movingObject === null, nextSpawnTimer === null, gameOver, spawnObject]);
 
   useEffect(() => { 
-    if (gameOver) {
+    if (gameOver && gameWordPool.length > 0) {
       updateRanking(score, theme); 
     }
   }, [gameOver]);
@@ -389,7 +426,6 @@ const App: React.FC = () => {
                       <span className={`w-6 h-6 flex items-center justify-center rounded-full text-xs font-bold ${i === 0 ? 'bg-amber-500' : 'bg-slate-500'}`}>{i + 1}</span>
                       <div className="text-left">
                         <div className="font-bold text-slate-200 text-sm">{r.name}</div>
-                        {/* Corrected: Accessing r.theme now that Ranking interface includes it */}
                         <div className="text-[9px] text-slate-500 uppercase">{r.theme || 'Basic'}</div>
                       </div>
                     </div>
@@ -400,6 +436,19 @@ const App: React.FC = () => {
                 <div className="text-slate-500 text-xs">No records yet.</div>
               )}
             </div>
+            
+            {/* Error Message UI */}
+            {errorMessage && (
+              <div className="mb-6 p-4 bg-rose-900/40 border border-rose-500/50 rounded-2xl text-left animate-in slide-in-from-top-2 duration-300">
+                <div className="flex items-center gap-2 text-rose-400 font-black text-xs uppercase mb-1">
+                  <i className="fa-solid fa-triangle-exclamation"></i> ERROR: GENERATION FAILED
+                </div>
+                <div className="text-rose-200 text-[11px] leading-relaxed font-medium">
+                  {errorMessage}
+                </div>
+              </div>
+            )}
+
             <div className="space-y-4">
               <input type="text" placeholder="PLAYER NAME" value={playerName} onChange={(e) => setPlayerName(e.target.value.toUpperCase().slice(0, 10))} className="w-full bg-slate-900 border-2 border-slate-700 rounded-2xl py-4 px-6 text-xl font-bold text-center tracking-widest focus:outline-none focus:border-blue-500 transition-all"/>
               <input type="text" placeholder="THEME (e.g. SPACE, FRUIT)" value={theme} onChange={(e) => setTheme(e.target.value)} className="w-full bg-slate-900 border-2 border-slate-700 rounded-2xl py-4 px-6 text-xl font-bold text-center tracking-widest focus:outline-none focus:border-blue-500 transition-all"/>
@@ -413,17 +462,12 @@ const App: React.FC = () => {
                     <span className="flex items-center gap-2">
                       <i className="fa-solid fa-spinner animate-spin"></i> GENERATING... ({loadingTime}s)
                     </span>
-                    {loadingTime > 15 && (
-                      <span className="text-[10px] mt-1 text-amber-300 font-normal normal-case">
-                        네트워크 연결이 지연되고 있습니다...
-                      </span>
-                    )}
                   </div>
-                ) : 'START GAME'}
+                ) : errorMessage ? 'RETRY GENERATION' : 'START GAME'}
               </button>
             </div>
           </div>
-          <p className="text-[10px] text-slate-500 font-black uppercase tracking-[0.2em]">20 Words Received • Vercel Optimized</p>
+          <p className="text-[10px] text-slate-500 font-black uppercase tracking-[0.2em]">Strict Data Policy • No Fallbacks Allowed</p>
         </div>
       </div>
     );

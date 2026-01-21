@@ -34,6 +34,4 @@ export const COLOR_PALETTE = [
   'bg-teal-600'    // 테일
 ];
 
-export const FALLBACK_WORDS = [
-  '나무', '바다', '하늘', '구름', '햇살', '파도', '모래', '숲속', '노래', '미소'
-];
+export const FALLBACK_WORDS = []; // 임시 데이터 대체 금지 원칙에 따라 비움
