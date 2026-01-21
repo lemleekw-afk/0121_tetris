@@ -11,27 +11,16 @@ export interface GameObject {
 export interface Ranking {
   name: string;
   score: number;
-  // theme property added to allow high scores to be tracked by specific game themes
   theme?: string;
 }
 
 export const COLUMNS = 6;
 export const ROWS = 10;
-export const FALL_DURATION = 1000; // 전체 낙하 시간 1초로 단축
-export const SPAWN_DELAY = 1000; // 생성 대기 시간 1초로 단축
+export const FALL_DURATION = 1000;
+export const SPAWN_DELAY = 1000;
 
-// 시각적으로 명확히 구분 가능한 고대비 색상 10종
 export const COLOR_PALETTE = [
-  'bg-red-600',    // 빨강
-  'bg-blue-600',   // 파랑
-  'bg-yellow-500', // 노랑
-  'bg-green-600',  // 초록
-  'bg-purple-600', // 보라
-  'bg-orange-500', // 오렌지
-  'bg-cyan-500',   // 청록
-  'bg-pink-500',   // 핑크
-  'bg-lime-500',   // 라임
-  'bg-teal-600'    // 테일
+  'bg-red-600', 'bg-blue-600', 'bg-yellow-500', 'bg-green-600',
+  'bg-purple-600', 'bg-orange-500', 'bg-cyan-500', 'bg-pink-500',
+  'bg-lime-500', 'bg-teal-600'
 ];
-
-export const FALLBACK_WORDS = []; // 임시 데이터 대체 금지 원칙에 따라 비움
