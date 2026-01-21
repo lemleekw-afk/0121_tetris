@@ -22,6 +22,7 @@ const App: React.FC = () => {
   const [isLoadingWords, setIsLoadingWords] = useState(false);
   const [loadingTime, setLoadingTime] = useState(0);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [dbErrorMessage, setDbErrorMessage] = useState<string | null>(null);
 
   // Game States
   const [score, setScore] = useState(0);
@@ -46,43 +47,42 @@ const App: React.FC = () => {
   const spawnTimerRef = useRef<number | null>(null);
   const comboTimeoutRef = useRef<number | null>(null);
   const loadingTimerRef = useRef<number | null>(null);
-  const abortControllerRef = useRef<AbortController | null>(null);
 
-  // --- Gemini API for Theme Words (Strict Failure Policy) ---
+  // --- Gemini API with Strict Timeout and Fast Prompt ---
   const generateWordsByTheme = async (selectedTheme: string): Promise<string[]> => {
     const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
     
-    try {
-      // Vercel 10s timeout strategy
-      const response = await ai.models.generateContent({
-        model: 'gemini-3-flash-preview',
-        contents: `당신은 단어 퍼즐 게임의 기획자입니다. 사용자가 입력한 [주제]와 매우 밀접한 한국어 단어 20개를 생성하세요.
-          규칙:
-          1. 고유한 한국어 명사 20개 (중복 금지)
-          2. 글자 수는 2자 이상 6자 이하
-          3. JSON 배열 형식: ["단어1", "단어2", ..., "단어20"]
-          
-          주제: ${selectedTheme}`,
-      });
+    // 타임아웃 처리를 위한 Promise.race 구현 (10초 강제 중단)
+    const timeoutPromise = new Promise<never>((_, reject) =>
+      setTimeout(() => reject(new Error("TIMEOUT")), 10000)
+    );
 
-      const text = response.text || "";
-      const jsonStr = text.match(/\[.*\]/s)?.[0] || "";
-      const parsed: string[] = JSON.parse(jsonStr);
-      const filtered = parsed.filter(w => /^[가-힣]+$/.test(w) && w.length >= 2 && w.length <= 6);
-      
-      if (filtered.length < 5) throw new Error("VALIDATION_ERROR");
-      return filtered.slice(0, 20);
-    } catch (error: any) {
-      console.error("AI Generation Error:", error);
-      // 에러 객체에 따라 상세 코드 할당
-      if (error.status === 401 || error.status === 403) throw new Error("AUTH_ERROR");
-      if (error.status === 429) throw new Error("RATE_LIMIT");
-      if (error.message === "VALIDATION_ERROR") throw new Error("DATA_ERROR");
-      throw error;
-    }
+    const apiCall = (async () => {
+      try {
+        const response = await ai.models.generateContent({
+          model: 'gemini-3-flash-preview',
+          contents: `[주제]: ${selectedTheme}. 한국어 단어 20개만 JSON 배열로 출력. 설명 금지. 예: ["단어1", "단어2"]`,
+          config: {
+            responseMimeType: "application/json"
+          }
+        });
+
+        const text = response.text || "";
+        const parsed: string[] = JSON.parse(text);
+        const filtered = parsed.filter(w => /^[가-힣]+$/.test(w) && w.length >= 2 && w.length <= 6);
+        
+        if (filtered.length < 5) throw new Error("DATA_ERROR");
+        return filtered.slice(0, 20);
+      } catch (err: any) {
+        if (err.name === 'SyntaxError') throw new Error("PARSE_ERROR");
+        throw err;
+      }
+    })();
+
+    return Promise.race([apiCall, timeoutPromise]);
   };
 
-  // --- Supabase Actions ---
+  // --- Supabase Actions with Theme Tracking ---
   const fetchRankings = async () => {
     setIsLoadingRankings(true);
     try {
@@ -96,32 +96,69 @@ const App: React.FC = () => {
 
   const updateRanking = async (finalScore: number, finalTheme: string) => {
     if (!playerName.trim() || gameWordPool.length === 0) return;
+    setDbErrorMessage(null);
+
     try {
       const checkRes = await fetch(`${SUPABASE_URL}/rest/v1/rankings?name=eq.${encodeURIComponent(playerName)}`, {
         headers: { 'apikey': SUPABASE_KEY, 'Authorization': `Bearer ${SUPABASE_KEY}` }
       });
       const existing = await checkRes.json();
       
+      let response;
       if (Array.isArray(existing) && existing.length > 0) {
         if (finalScore > existing[0].score) {
-          await fetch(`${SUPABASE_URL}/rest/v1/rankings?name=eq.${encodeURIComponent(playerName)}`, {
+          response = await fetch(`${SUPABASE_URL}/rest/v1/rankings?name=eq.${encodeURIComponent(playerName)}`, {
             method: 'PATCH',
-            headers: { 'apikey': SUPABASE_KEY, 'Authorization': `Bearer ${SUPABASE_KEY}`, 'Content-Type': 'application/json' },
+            headers: { 
+              'apikey': SUPABASE_KEY, 
+              'Authorization': `Bearer ${SUPABASE_KEY}`, 
+              'Content-Type': 'application/json',
+              'Prefer': 'return=representation'
+            },
             body: JSON.stringify({ score: finalScore, theme: finalTheme })
           });
         }
       } else {
-        await fetch(`${SUPABASE_URL}/rest/v1/rankings`, {
+        response = await fetch(`${SUPABASE_URL}/rest/v1/rankings`, {
           method: 'POST',
-          headers: { 'apikey': SUPABASE_KEY, 'Authorization': `Bearer ${SUPABASE_KEY}`, 'Content-Type': 'application/json' },
+          headers: { 
+            'apikey': SUPABASE_KEY, 
+            'Authorization': `Bearer ${SUPABASE_KEY}`, 
+            'Content-Type': 'application/json',
+            'Prefer': 'return=representation'
+          },
           body: JSON.stringify({ name: playerName, score: finalScore, theme: finalTheme })
         });
       }
+
+      if (response) {
+        const result = await response.json();
+        if (response.status === 403 || (result.message && result.message.includes("RLS"))) {
+          setDbErrorMessage("점수 저장 실패: DB 권한 설정 오류 (RLS Policy)");
+        }
+      }
       fetchRankings();
-    } catch (error) {}
+    } catch (error) {
+      setDbErrorMessage("네트워크 문제로 점수를 저장하지 못했습니다.");
+    }
   };
 
-  // --- Match & Gravity Logic ---
+  // --- Game Mechanics ---
+  const applyGravityToBoard = (currentBoard: (GameObject | null)[][]) => {
+    for (let c = 0; c < COLUMNS; c++) {
+      let writeIdx = ROWS - 1;
+      for (let r = ROWS - 1; r >= 0; r--) {
+        if (currentBoard[r][c] !== null) {
+          if (writeIdx !== r) {
+            currentBoard[writeIdx][c] = { ...currentBoard[r][c]!, row: writeIdx };
+            currentBoard[r][c] = null;
+          }
+          writeIdx--;
+        }
+      }
+    }
+  };
+
   const getConnections = (targetBoard: (GameObject | null)[][], r: number, c: number) => {
     const startObj = targetBoard[r][c];
     if (!startObj) return [];
@@ -142,21 +179,6 @@ const App: React.FC = () => {
       }
     }
     return connected;
-  };
-
-  const applyGravityToBoard = (currentBoard: (GameObject | null)[][]) => {
-    for (let c = 0; c < COLUMNS; c++) {
-      let writeIdx = ROWS - 1;
-      for (let r = ROWS - 1; r >= 0; r--) {
-        if (currentBoard[r][c] !== null) {
-          if (writeIdx !== r) {
-            currentBoard[writeIdx][c] = { ...currentBoard[r][c]!, row: writeIdx };
-            currentBoard[r][c] = null;
-          }
-          writeIdx--;
-        }
-      }
-    }
   };
 
   const processChainReactions = (currentBoard: (GameObject | null)[][]): { board: (GameObject | null)[][], points: number } => {
@@ -232,13 +254,11 @@ const App: React.FC = () => {
   const spawnObject = useCallback(() => {
     setBoard(currentBoard => {
       if (gameOver || isLobby || gameWordPool.length === 0) return currentBoard;
-      
       const spawnCol = Math.floor(Math.random() * COLUMNS);
       if (currentBoard[0][spawnCol] !== null) {
         setGameOver(true);
         return currentBoard;
       }
-
       setNextWord(prevNext => {
         const wordToSpawn = prevNext || gameWordPool[Math.floor(Math.random() * gameWordPool.length)];
         const newObj: GameObject = {
@@ -249,7 +269,6 @@ const App: React.FC = () => {
         setMovingObject(newObj);
         return gameWordPool[Math.floor(Math.random() * gameWordPool.length)];
       });
-
       return currentBoard;
     });
   }, [gameOver, isLobby, gameWordPool, wordColorMap]);
@@ -277,10 +296,8 @@ const App: React.FC = () => {
     e.preventDefault();
     const wordToMatch = inputValue.trim();
     if (!wordToMatch) return;
-
     let targetDeletedInBoard = false;
     let totalPointsGained = 0;
-
     setBoard(prevBoard => {
       const newBoard = prevBoard.map(row => [...row]);
       let targetFound = false;
@@ -289,8 +306,7 @@ const App: React.FC = () => {
           if (newBoard[r][c]?.word === wordToMatch) {
             newBoard[r][c] = null;
             totalPointsGained += 10;
-            targetFound = true;
-            targetDeletedInBoard = true;
+            targetFound = true; targetDeletedInBoard = true;
             r = -1; c = COLUMNS; 
           }
         }
@@ -309,14 +325,9 @@ const App: React.FC = () => {
       }
       return prevBoard;
     });
-
     if (!targetDeletedInBoard && movingObject?.word === wordToMatch) {
       setMovingObject(null);
-      setScore(s => {
-        const ns = s + 10;
-        startSpawnCountdown();
-        return ns;
-      });
+      setScore(s => { const ns = s + 10; startSpawnCountdown(); return ns; });
     }
     setInputValue('');
   };
@@ -326,25 +337,15 @@ const App: React.FC = () => {
     setIsLoadingWords(true);
     setLoadingTime(0);
     setErrorMessage(null);
+    setDbErrorMessage(null);
     
-    // 로딩 타이머
     if (loadingTimerRef.current) clearInterval(loadingTimerRef.current);
     loadingTimerRef.current = window.setInterval(() => {
-      setLoadingTime(prev => {
-        if (prev >= 10) {
-          clearInterval(loadingTimerRef.current!);
-          setErrorMessage("Vercel 서버리스 시간 초과(10초)가 발생했습니다. API 응답 속도 최적화가 필요합니다.");
-          setIsLoadingWords(false);
-          return prev;
-        }
-        return prev + 1;
-      });
+      setLoadingTime(prev => prev + 1);
     }, 1000);
 
     try {
       const words = await generateWordsByTheme(theme);
-      
-      // 성공 시 타이머 정리
       if (loadingTimerRef.current) clearInterval(loadingTimerRef.current);
       
       const colorMap: Record<string, string> = {};
@@ -363,20 +364,14 @@ const App: React.FC = () => {
       if (loadingTimerRef.current) clearInterval(loadingTimerRef.current);
       setIsLoadingWords(false);
       
-      // 상세 에러 메시지 맵핑
-      switch(error.message) {
-        case "AUTH_ERROR":
-          setErrorMessage("API 키가 유효하지 않거나 환경 변수 설정이 누락되었습니다. Vercel 설정을 확인하십시오.");
-          break;
-        case "RATE_LIMIT":
-          setErrorMessage("API 요청 횟수 제한을 초과했습니다. 잠시 후 다시 시도하십시오.");
-          break;
-        case "DATA_ERROR":
-          setErrorMessage("AI가 유효한 단어 데이터를 생성하지 못했습니다. 다른 주제로 시도해 주세요.");
-          break;
-        default:
-          setErrorMessage("클라이언트와 서버 간 연결이 끊겼습니다. 네트워크 상태를 점검하십시오.");
-          break;
+      if (error.message === "TIMEOUT") {
+        setErrorMessage("시스템 오류: Vercel 서버 응답 시간 초과 (Timeout)");
+      } else if (error.message === "PARSE_ERROR" || error.message === "DATA_ERROR") {
+        setErrorMessage("API 오류 발생: 데이터 형식이 올바르지 않습니다.");
+      } else if (error.name === "AbortError" || !navigator.onLine) {
+        setErrorMessage("네트워크 연결 실패. 인터넷 상태를 확인하십시오.");
+      } else {
+        setErrorMessage(`API 오류 발생: ${error.status || 'Unknown'}`);
       }
     }
   };
@@ -391,6 +386,7 @@ const App: React.FC = () => {
     setInputValue('');
     setGameWordPool([]);
     setErrorMessage(null);
+    setDbErrorMessage(null);
   };
 
   useEffect(() => { fetchRankings(); }, []);
@@ -437,7 +433,6 @@ const App: React.FC = () => {
               )}
             </div>
             
-            {/* Error Message UI */}
             {errorMessage && (
               <div className="mb-6 p-4 bg-rose-900/40 border border-rose-500/50 rounded-2xl text-left animate-in slide-in-from-top-2 duration-300">
                 <div className="flex items-center gap-2 text-rose-400 font-black text-xs uppercase mb-1">
@@ -467,7 +462,7 @@ const App: React.FC = () => {
               </button>
             </div>
           </div>
-          <p className="text-[10px] text-slate-500 font-black uppercase tracking-[0.2em]">Strict Data Policy • No Fallbacks Allowed</p>
+          <p className="text-[10px] text-slate-500 font-black uppercase tracking-[0.2em]">Strict Mode • 10s Force Timeout</p>
         </div>
       </div>
     );
@@ -531,7 +526,12 @@ const App: React.FC = () => {
             <div className="absolute inset-0 z-50 flex flex-col items-center justify-center bg-slate-900/95 backdrop-blur-md animate-in fade-in duration-300">
               <i className="fa-solid fa-skull-crossbones text-5xl text-rose-500 mb-4"></i>
               <h2 className="text-3xl font-black mb-2 uppercase tracking-tighter">Terminated</h2>
-              <p className="text-slate-400 mb-8 font-bold uppercase tracking-widest">Final Score: {score}</p>
+              <p className="text-slate-400 mb-2 font-bold uppercase tracking-widest">Final Score: {score}</p>
+              {dbErrorMessage && (
+                <div className="text-rose-400 text-[9px] mb-6 font-bold uppercase animate-pulse">
+                  {dbErrorMessage}
+                </div>
+              )}
               <div className="flex flex-col gap-3 w-40">
                 <button onClick={startGame} className="py-3 bg-blue-600 text-white font-black rounded-xl text-xs uppercase hover:bg-blue-500 transition-colors">Replay</button>
                 <button onClick={resetToLobby} className="py-3 bg-slate-700 text-white font-black rounded-xl text-xs uppercase hover:bg-slate-600 transition-colors">Menu</button>
