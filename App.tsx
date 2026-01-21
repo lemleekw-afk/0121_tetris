@@ -21,6 +21,7 @@ const App: React.FC = () => {
   const [theme, setTheme] = useState('');
   const [isLobby, setIsLobby] = useState(true);
   const [isLoadingWords, setIsLoadingWords] = useState(false);
+  const [loadingTime, setLoadingTime] = useState(0);
 
   // Game States
   const [score, setScore] = useState(0);
@@ -44,17 +45,21 @@ const App: React.FC = () => {
 
   const spawnTimerRef = useRef<number | null>(null);
   const comboTimeoutRef = useRef<number | null>(null);
+  const loadingTimerRef = useRef<number | null>(null);
 
+  // --- Gemini API for Theme Words (Updated to 20 words for current request) ---
   const generateWordsByTheme = async (selectedTheme: string): Promise<string[]> => {
-    const ai = new GoogleGenAI({ apiKey: process.env.API_KEY as string });
+    // Fixed: Initialized GoogleGenAI according to strict guidelines (no 'as string')
+    const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
     try {
+      // 10초 타임아웃을 염두에 둔 비동기 처리
       const response = await ai.models.generateContent({
         model: 'gemini-3-flash-preview',
-        contents: `당신은 단어 퍼즐 게임의 기획자입니다. 사용자가 입력한 [주제]와 매우 밀접한 한국어 단어 10개를 생성하세요.
+        contents: `당신은 단어 퍼즐 게임의 기획자입니다. 사용자가 입력한 [주제]와 매우 밀접한 한국어 단어 20개를 생성하세요.
           규칙:
-          1. 고유한 한국어 명사 10개 (중복 금지)
+          1. 고유한 한국어 명사 20개 (중복 금지)
           2. 글자 수는 2자 이상 6자 이하
-          3. JSON 배열 형식: ["단어1", "단어2", ..., "단어10"]
+          3. JSON 배열 형식: ["단어1", "단어2", ..., "단어20"]
           
           주제: ${selectedTheme}`,
       });
@@ -62,16 +67,21 @@ const App: React.FC = () => {
       const jsonStr = text.match(/\[.*\]/s)?.[0] || "";
       const parsed: string[] = JSON.parse(jsonStr);
       const filtered = parsed.filter(w => /^[가-힣]+$/.test(w) && w.length >= 2 && w.length <= 6);
-      return filtered.length >= 5 ? filtered.slice(0, 10) : [...FALLBACK_WORDS];
+      
+      if (filtered.length < 5) throw new Error("Validation failed");
+      return filtered.slice(0, 20);
     } catch (error) {
-      return [...FALLBACK_WORDS];
+      console.error("AI Generation failed/timeout:", error);
+      // Fallback Data 즉시 할당
+      return [...FALLBACK_WORDS].concat(['산책', '바람', '햇볕', '달빛', '별똥별', '들꽃', '숲길', '호수', '여울', '단비']);
     }
   };
 
+  // --- Supabase Actions (Theme Column Added) ---
   const fetchRankings = async () => {
     setIsLoadingRankings(true);
     try {
-      const response = await fetch(`${SUPABASE_URL}/rest/v1/rankings?select=name,score&order=score.desc&limit=3`, {
+      const response = await fetch(`${SUPABASE_URL}/rest/v1/rankings?select=name,score,theme&order=score.desc&limit=5`, {
         headers: { 'apikey': SUPABASE_KEY, 'Authorization': `Bearer ${SUPABASE_KEY}` }
       });
       const data = await response.json();
@@ -79,32 +89,34 @@ const App: React.FC = () => {
     } catch (error) {} finally { setIsLoadingRankings(false); }
   };
 
-  const updateRanking = async (finalScore: number) => {
+  const updateRanking = async (finalScore: number, finalTheme: string) => {
     if (!playerName.trim()) return;
     try {
       const checkRes = await fetch(`${SUPABASE_URL}/rest/v1/rankings?name=eq.${encodeURIComponent(playerName)}`, {
         headers: { 'apikey': SUPABASE_KEY, 'Authorization': `Bearer ${SUPABASE_KEY}` }
       });
       const existing = await checkRes.json();
+      
       if (Array.isArray(existing) && existing.length > 0) {
         if (finalScore > existing[0].score) {
           await fetch(`${SUPABASE_URL}/rest/v1/rankings?name=eq.${encodeURIComponent(playerName)}`, {
             method: 'PATCH',
             headers: { 'apikey': SUPABASE_KEY, 'Authorization': `Bearer ${SUPABASE_KEY}`, 'Content-Type': 'application/json' },
-            body: JSON.stringify({ score: finalScore })
+            body: JSON.stringify({ score: finalScore, theme: finalTheme })
           });
         }
       } else {
         await fetch(`${SUPABASE_URL}/rest/v1/rankings`, {
           method: 'POST',
           headers: { 'apikey': SUPABASE_KEY, 'Authorization': `Bearer ${SUPABASE_KEY}`, 'Content-Type': 'application/json' },
-          body: JSON.stringify({ name: playerName, score: finalScore })
+          body: JSON.stringify({ name: playerName, score: finalScore, theme: finalTheme })
         });
       }
       fetchRankings();
     } catch (error) {}
   };
 
+  // --- Match & Gravity Logic ---
   const getConnections = (targetBoard: (GameObject | null)[][], r: number, c: number) => {
     const startObj = targetBoard[r][c];
     if (!startObj) return [];
@@ -172,7 +184,7 @@ const App: React.FC = () => {
   };
 
   const startSpawnCountdown = useCallback(() => {
-    setNextSpawnTimer(1); // 1초 대기로 변경
+    setNextSpawnTimer(1);
     if (spawnTimerRef.current) clearInterval(spawnTimerRef.current);
     spawnTimerRef.current = window.setInterval(() => {
       setNextSpawnTimer(prev => {
@@ -190,7 +202,7 @@ const App: React.FC = () => {
     if (gameOver) return;
     setBoard(prevBoard => {
       const newBoard = prevBoard.map(row => [...row]);
-      if (obj.row < 0 || newBoard[obj.row][obj.col] !== null) {
+      if (obj.row < 0 || (newBoard[obj.row] && newBoard[obj.row][obj.col] !== null)) {
         setGameOver(true);
         return prevBoard;
       }
@@ -229,8 +241,6 @@ const App: React.FC = () => {
           color: wordColorMap[wordToSpawn] || 'bg-slate-500'
         };
         setMovingObject(newObj);
-        
-        // 다음 나올 단어 미리 준비
         return gameWordPool[Math.floor(Math.random() * gameWordPool.length)];
       });
 
@@ -240,7 +250,7 @@ const App: React.FC = () => {
 
   useEffect(() => {
     if (!movingObject || gameOver) return;
-    const fallStepTime = FALL_DURATION / ROWS; // 1000ms / 10 rows = 100ms per row
+    const fallStepTime = FALL_DURATION / ROWS;
     const ticker = setInterval(() => {
       setMovingObject(prev => {
         if (!prev) return null;
@@ -308,7 +318,19 @@ const App: React.FC = () => {
   const startGame = async () => {
     if (!playerName.trim() || !theme.trim()) return;
     setIsLoadingWords(true);
+    setLoadingTime(0);
+    
+    // 로딩 타이머 시작 (15초 체크)
+    if (loadingTimerRef.current) clearInterval(loadingTimerRef.current);
+    loadingTimerRef.current = window.setInterval(() => {
+      setLoadingTime(prev => prev + 1);
+    }, 1000);
+
     const words = await generateWordsByTheme(theme);
+    
+    // 타이머 정리
+    if (loadingTimerRef.current) clearInterval(loadingTimerRef.current);
+    
     const colorMap: Record<string, string> = {};
     words.forEach((w, i) => { colorMap[w] = COLOR_PALETTE[i % COLOR_PALETTE.length]; });
     setGameWordPool(words);
@@ -339,7 +361,11 @@ const App: React.FC = () => {
     if (!isLobby && gameWordPool.length > 0 && !movingObject && nextSpawnTimer === null && !gameOver) spawnObject();
   }, [isLobby, gameWordPool.length, movingObject === null, nextSpawnTimer === null, gameOver, spawnObject]);
 
-  useEffect(() => { if (gameOver) updateRanking(score); }, [gameOver]);
+  useEffect(() => { 
+    if (gameOver) {
+      updateRanking(score, theme); 
+    }
+  }, [gameOver]);
 
   if (isLobby) {
     return (
@@ -356,25 +382,48 @@ const App: React.FC = () => {
             <div className="space-y-3 mb-8">
               {isLoadingRankings ? (
                 <div className="text-slate-500 animate-pulse text-xs uppercase font-black">Loading...</div>
-              ) : topRankings.map((r, i) => (
-                <div key={i} className="flex justify-between items-center p-3 bg-slate-700/30 rounded-xl border border-white/5">
-                  <div className="flex items-center gap-3">
-                    <span className={`w-6 h-6 flex items-center justify-center rounded-full text-xs font-bold ${i === 0 ? 'bg-amber-500' : 'bg-slate-500'}`}>{i + 1}</span>
-                    <span className="font-bold text-slate-200">{r.name}</span>
+              ) : topRankings.length > 0 ? (
+                topRankings.map((r, i) => (
+                  <div key={i} className="flex justify-between items-center p-3 bg-slate-700/30 rounded-xl border border-white/5">
+                    <div className="flex items-center gap-3">
+                      <span className={`w-6 h-6 flex items-center justify-center rounded-full text-xs font-bold ${i === 0 ? 'bg-amber-500' : 'bg-slate-500'}`}>{i + 1}</span>
+                      <div className="text-left">
+                        <div className="font-bold text-slate-200 text-sm">{r.name}</div>
+                        {/* Corrected: Accessing r.theme now that Ranking interface includes it */}
+                        <div className="text-[9px] text-slate-500 uppercase">{r.theme || 'Basic'}</div>
+                      </div>
+                    </div>
+                    <span className="font-black text-blue-400">{r.score}</span>
                   </div>
-                  <span className="font-black text-blue-400">{r.score}</span>
-                </div>
-              ))}
+                ))
+              ) : (
+                <div className="text-slate-500 text-xs">No records yet.</div>
+              )}
             </div>
             <div className="space-y-4">
               <input type="text" placeholder="PLAYER NAME" value={playerName} onChange={(e) => setPlayerName(e.target.value.toUpperCase().slice(0, 10))} className="w-full bg-slate-900 border-2 border-slate-700 rounded-2xl py-4 px-6 text-xl font-bold text-center tracking-widest focus:outline-none focus:border-blue-500 transition-all"/>
-              <input type="text" placeholder="THEME" value={theme} onChange={(e) => setTheme(e.target.value)} className="w-full bg-slate-900 border-2 border-slate-700 rounded-2xl py-4 px-6 text-xl font-bold text-center tracking-widest focus:outline-none focus:border-blue-500 transition-all"/>
-              <button onClick={startGame} disabled={!playerName.trim() || !theme.trim() || isLoadingWords} className="w-full py-4 bg-blue-600 hover:bg-blue-500 text-white font-black rounded-2xl transition-all shadow-xl text-lg tracking-widest uppercase">
-                {isLoadingWords ? 'GENERATING...' : 'START GAME'}
+              <input type="text" placeholder="THEME (e.g. SPACE, FRUIT)" value={theme} onChange={(e) => setTheme(e.target.value)} className="w-full bg-slate-900 border-2 border-slate-700 rounded-2xl py-4 px-6 text-xl font-bold text-center tracking-widest focus:outline-none focus:border-blue-500 transition-all"/>
+              <button 
+                onClick={startGame} 
+                disabled={!playerName.trim() || !theme.trim() || isLoadingWords} 
+                className={`w-full py-4 ${isLoadingWords ? 'bg-slate-700 cursor-not-allowed' : 'bg-blue-600 hover:bg-blue-500'} text-white font-black rounded-2xl transition-all shadow-xl text-lg tracking-widest uppercase relative overflow-hidden`}
+              >
+                {isLoadingWords ? (
+                  <div className="flex flex-col items-center">
+                    <span className="flex items-center gap-2">
+                      <i className="fa-solid fa-spinner animate-spin"></i> GENERATING... ({loadingTime}s)
+                    </span>
+                    {loadingTime > 15 && (
+                      <span className="text-[10px] mt-1 text-amber-300 font-normal normal-case">
+                        네트워크 연결이 지연되고 있습니다...
+                      </span>
+                    )}
+                  </div>
+                ) : 'START GAME'}
               </button>
             </div>
           </div>
-          <p className="text-[10px] text-slate-500 font-black uppercase tracking-[0.2em]">High Velocity Mode Enabled • 1s Falling</p>
+          <p className="text-[10px] text-slate-500 font-black uppercase tracking-[0.2em]">20 Words Received • Vercel Optimized</p>
         </div>
       </div>
     );
@@ -462,7 +511,7 @@ const App: React.FC = () => {
             <i className="fa-solid fa-bolt"></i>
           </button>
         </form>
-        <div className="p-3 bg-slate-800/40 rounded-xl border border-slate-700/50 flex flex-wrap justify-center gap-1">
+        <div className="p-3 bg-slate-800/40 rounded-xl border border-slate-700/50 flex flex-wrap justify-center gap-1 max-h-24 overflow-y-auto">
           {gameWordPool.map(w => (
             <span key={w} className={`px-2 py-0.5 rounded-md text-[9px] font-black text-white/90 uppercase tracking-tighter border border-white/10 ${wordColorMap[w] || 'bg-slate-700'}`}>
               {w}

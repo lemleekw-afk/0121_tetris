@@ -11,6 +11,8 @@ export interface GameObject {
 export interface Ranking {
   name: string;
   score: number;
+  // theme property added to allow high scores to be tracked by specific game themes
+  theme?: string;
 }
 
 export const COLUMNS = 6;
