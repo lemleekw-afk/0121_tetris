@@ -1,0 +1,5 @@
+{
+  "name": "Word Drop Puzzle",
+  "description": "A strategic word puzzle game where falling words must be cleared by typing or matching sequences. Features a 7x12 grid, physics-based landing logic, and chain-reaction scoring.",
+  "requestFramePermissions": []
+}
